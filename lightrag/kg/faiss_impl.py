@@ -171,48 +171,55 @@ class FaissVectorDBStorage(BaseVectorStorage):
         logger.info(f"Upserted {len(list_data)} vectors into Faiss index.")
         return [m["__id__"] for m in list_data]
 
-    async def query(
-        self, query: str, top_k: int, ids: list[str] | None = None
-    ) -> list[dict[str, Any]]:
+    async def query(self, query: str, top_k: int, ids: list[str] | None = None) -> list[dict[str, Any]]:
         """
-        Search by a textual query; returns top_k results with their metadata + similarity distance.
+        Search for the top_k closest vectors to the query embedding.
+        
+        Args:
+            query: The query text to convert to an embedding and search for
+            top_k: The number of results to return
+            ids: Optional list of IDs to filter results by
+            
+        Returns:
+            List of matching records with similarity scores
         """
+        # Execute embedding outside of lock to avoid long lock times
         embedding = await self.embedding_func([query])
-        # embedding is shape (1, dim)
-        embedding = np.array(embedding, dtype=np.float32)
-        faiss.normalize_L2(embedding)  # we do in-place normalization
-
-        logger.info(
-            f"Query: {query}, top_k: {top_k}, threshold: {self.cosine_better_than_threshold}"
-        )
-
-        # Perform the similarity search
+        embedding = embedding[0].astype(np.float32)
+        
+        # Normalize the query embedding for cosine similarity
+        faiss.normalize_L2(np.reshape(embedding, (1, -1)))
+        
+        # Get the index (which may reload from disk if updated by another process)
         index = await self._get_index()
-        distances, indices = index.search(embedding, top_k)
-
-        distances = distances[0]
-        indices = indices[0]
-
+        
+        # Execute the search
+        distances, indices = index.search(np.reshape(embedding, (1, -1)), top_k)
+        
+        # Process results
         results = []
-        for dist, idx in zip(distances, indices):
+        for i, (idx, dist) in enumerate(zip(indices[0], distances[0])):
+            # Skip invalid indices
             if idx == -1:
-                # Faiss returns -1 if no neighbor
                 continue
-
+            
             # Cosine similarity threshold
             if dist < self.cosine_better_than_threshold:
                 continue
-
+                
             meta = self._id_to_meta.get(idx, {})
-            results.append(
-                {
-                    **meta,
-                    "id": meta.get("__id__"),
-                    "distance": float(dist),
-                    "created_at": meta.get("__created_at__"),
-                }
-            )
-
+            
+            # Skip if ids filter is provided and this id is not in the filter
+            if ids is not None and meta.get("__id__") not in ids:
+                continue
+                
+            results.append({
+                **meta,
+                "id": meta.get("__id__"),
+                "distance": float(dist),
+                "created_at": meta.get("__created_at__"),
+            })
+        
         return results
 
     @property
